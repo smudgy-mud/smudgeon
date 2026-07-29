@@ -32,6 +32,32 @@ console, so you can line up what you see against what was sent.
 `--stress-bytes` (default 256 KiB) sizes the three unbounded-growth probes.
 Raise it to lean harder on a client's buffer caps.
 
+## Browser clients (WebSocket)
+
+Browser front-ends (LOCiterm and other xterm.js clients) connect over
+WebSocket instead of raw TCP:
+
+```
+python smudgeon.py --ws                # ws://127.0.0.1:4123
+python smudgeon.py --wss --certfile cert.pem --keyfile key.pem   # wss://
+```
+
+Application bytes travel as **binary** frames (a text frame must be valid
+UTF-8, which would neuter the `invalid_utf8` probe before the client's own
+decoder saw it). The frame layer enforces RFC 6455 on the client — masking,
+control-frame limits, sane lengths — so a client with a framing bug fails
+here, loudly, rather than later against a production endpoint.
+
+For a throwaway self-signed certificate for `--wss`:
+
+```
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
+  -days 30 -subj "/CN=localhost"
+```
+
+(Your browser will warn about the self-signed certificate; accept it for
+`https://localhost:<port>` once, or use a locally-trusted cert from `mkcert`.)
+
 ## What to look for
 
 A robust client should get through the whole gauntlet with the connection
