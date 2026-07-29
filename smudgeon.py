@@ -33,7 +33,11 @@ Public License (the LICENSE file) for details.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import socket
+import ssl
+import struct
 import sys
 import threading
 import time
@@ -53,14 +57,224 @@ ST = ESC + b"\\"  # OSC/string terminator
 BEL = b"\x07"
 
 
+# ---- transports --------------------------------------------------------------
+# Attacks speak in application bytes; a transport decides how those bytes reach
+# the client. Raw TCP is a passthrough (a classic MUD client). WebSocket frames
+# each write as a BINARY message so browser clients (LOCiterm and other
+# xterm.js front-ends) can connect. Binary, not text, is deliberate: a WS text
+# frame must be valid UTF-8, so the invalid_utf8 probe would be rejected by the
+# browser's WS layer before the client's own decoder ever saw it. WSS is the
+# same WebSocket transport over a TLS-wrapped socket.
+
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class RawTransport:
+    """Plain TCP: the byte stream is the wire, unmodified."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._send_lock = threading.Lock()
+        self.info = "raw TCP"
+
+    def send_bytes(self, data: bytes) -> None:
+        with self._send_lock:
+            self.sock.sendall(data)
+
+    def recv(self) -> bytes:
+        return self.sock.recv(4096)
+
+    def close(self) -> None:
+        close_socket(self.sock)
+
+
+class WsTransport:
+    """WebSocket (RFC 6455) over an already-connected (optionally TLS) socket.
+
+    Performs the HTTP upgrade handshake on construction, then sends application
+    bytes as binary frames and returns reassembled incoming messages. Client
+    frames must be masked and control frames well-formed (RFC 6455 is enforced,
+    not assumed — a client with a framing bug should fail HERE, loudly, not
+    later against a production endpoint). Ping is answered with pong; a close
+    frame ends `recv`. A single send lock serializes the attack thread's data
+    frames against the reader thread's control replies so frame bytes never
+    interleave on the wire."""
+
+    # Bound on a single frame's declared length. RFC 6455 allows 2**63 - 1;
+    # anything a MUD client legitimately sends (keystrokes, GMCP) is tiny, and
+    # an unbounded `_take` would buffer a hostile 64-bit length to MemoryError.
+    _MAX_FRAME = 1 << 20
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._send_lock = threading.Lock()
+        self._buf = bytearray()
+        self.path = "/"
+        self.info = "WebSocket"
+        self._handshake()
+
+    def _recv_into_buf(self) -> None:
+        chunk = self.sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("socket closed")
+        self._buf.extend(chunk)
+
+    def _take(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            self._recv_into_buf()
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def _handshake(self) -> None:
+        # Read request headers (bounded), then answer the Upgrade.
+        self.sock.settimeout(10.0)
+        try:
+            while b"\r\n\r\n" not in self._buf:
+                self._recv_into_buf()
+                if len(self._buf) > 65536:
+                    raise ConnectionError("oversized WebSocket handshake")
+        finally:
+            self.sock.settimeout(None)
+        blob, _, rest = bytes(self._buf).partition(b"\r\n\r\n")
+        self._buf = bytearray(rest)
+        lines = blob.split(b"\r\n")
+        request = lines[0].split(b" ")
+        if len(request) >= 2:
+            self.path = request[1].decode("latin-1", "replace")
+        headers: dict[bytes, bytes] = {}
+        for line in lines[1:]:
+            k, sep, v = line.partition(b":")
+            if sep:
+                headers[k.strip().lower()] = v.strip()
+        key = headers.get(b"sec-websocket-key")
+        if not key:
+            try:
+                self.sock.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+                                  b"smudgeon speaks WebSocket on this port\n")
+            except OSError:
+                pass
+            raise ConnectionError("not a WebSocket upgrade (no Sec-WebSocket-Key)")
+        accept = base64.b64encode(hashlib.sha1(key + WS_GUID).digest())
+        response = (
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept + b"\r\n"
+        )
+        proto = headers.get(b"sec-websocket-protocol")
+        if proto:
+            # Echo the client's first offered subprotocol. A browser that asked
+            # for one treats a 101 without this echo as a failed handshake and
+            # drops the socket — after "handshake OK" has already printed.
+            first = proto.split(b",")[0].strip()
+            response += b"Sec-WebSocket-Protocol: " + first + b"\r\n"
+            print(f"     (WS subprotocol selected: "
+                  f"{first.decode('latin-1', 'replace')})", flush=True)
+        self.sock.sendall(response + b"\r\n")
+
+    @staticmethod
+    def _frame(opcode: int, payload: bytes) -> bytes:
+        header = bytearray([0x80 | opcode])  # FIN + opcode
+        n = len(payload)
+        if n < 126:
+            header.append(n)
+        elif n < 65536:
+            header.append(126)
+            header += struct.pack("!H", n)
+        else:
+            header.append(127)
+            header += struct.pack("!Q", n)
+        return bytes(header) + payload
+
+    def _safe_send(self, frame: bytes) -> None:
+        with self._send_lock:
+            try:
+                self.sock.sendall(frame)
+            except OSError:
+                pass
+
+    def send_bytes(self, data: bytes) -> None:
+        with self._send_lock:
+            self.sock.sendall(self._frame(0x2, data))  # 0x2 = binary
+
+    def recv(self) -> bytes:
+        """One complete application message, fragments reassembled. Returns
+        `b""` only for a close frame — an empty data message is skipped, so a
+        client keepalive cannot masquerade as a close and end the gauntlet."""
+        message = bytearray()
+        fragmented = False
+        while True:
+            b0 = self._take(1)[0]
+            fin = bool(b0 & 0x80)
+            opcode = b0 & 0x0F
+            b1 = self._take(1)[0]
+            masked = bool(b1 & 0x80)
+            length = b1 & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._take(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._take(8))[0]
+                if length >> 63:
+                    raise ConnectionError("WebSocket length MSB set (RFC 6455 s5.2)")
+            if not masked:
+                raise ConnectionError("unmasked client frame (RFC 6455 s5.1)")
+            if opcode >= 0x8 and (not fin or length > 125):
+                raise ConnectionError("malformed WebSocket control frame (RFC 6455 s5.5)")
+            if length > self._MAX_FRAME:
+                raise ConnectionError(
+                    f"{length}-byte WebSocket frame exceeds the {self._MAX_FRAME}-byte cap")
+            mask = self._take(4)
+            payload = bytearray(self._take(length))
+            for i in range(length):
+                payload[i] ^= mask[i & 3]
+            if opcode == 0x8:            # close
+                self._safe_send(self._frame(0x8, b""))
+                return b""
+            if opcode == 0x9:            # ping -> pong (<= 125 bytes, checked above)
+                self._safe_send(self._frame(0xA, bytes(payload)))
+                continue
+            if opcode == 0xA:            # pong: ignore
+                continue
+            if opcode in (0x1, 0x2):     # text/binary: a message begins
+                if fragmented:
+                    raise ConnectionError("new WebSocket message inside a fragmented one")
+                message = payload
+            elif opcode == 0x0:          # continuation
+                if not fragmented:
+                    raise ConnectionError("WebSocket continuation with no message in progress")
+                message.extend(payload)
+            else:
+                raise ConnectionError(f"unknown WebSocket opcode {opcode:#x}")
+            if not fin:
+                fragmented = True
+                continue
+            fragmented = False
+            if not message:              # empty complete message: data, not a close
+                continue
+            return bytes(message)
+
+    def close(self) -> None:
+        # Bounded best-effort close frame: the peer may have stopped reading,
+        # and an unbounded `sendall` on this blocking socket would park the
+        # teardown forever (wedging --loop between clients). The timeout turns
+        # that into an OSError that `_safe_send` swallows.
+        try:
+            self.sock.settimeout(2.0)
+        except OSError:
+            pass
+        self._safe_send(self._frame(0x8, b""))
+        close_socket(self.sock)
+
+
 # ---- connection wrapper ------------------------------------------------------
 
 
 class Peer:
     """One connected client, plus the shared state the reader thread fills in."""
 
-    def __init__(self, sock: socket.socket, delay_ms: int, stress_bytes: int):
-        self.sock = sock
+    def __init__(self, transport, delay_ms: int, stress_bytes: int):
+        self.transport = transport
         self.delay = delay_ms / 1000.0
         self.stress_bytes = stress_bytes
         self.alive = True
@@ -72,7 +286,7 @@ class Peer:
         if not self.alive:
             return
         try:
-            self.sock.sendall(data)
+            self.transport.send_bytes(data)
         except OSError:
             self.alive = False
 
@@ -323,16 +537,17 @@ def mxp_malformed(p: Peer) -> None:
 def reader_thread(p: Peer) -> None:
     """Drain and log whatever the client sends, so the socket never backs up
     and we can report negotiation attempts. Also detects COMPRESS2 acceptance."""
-    buf = bytearray()
-    sock = p.sock
     while p.alive:
         try:
-            data = sock.recv(4096)
-        except OSError:
+            data = p.transport.recv()
+        except Exception as exc:  # a closed socket or malformed frame ends the reader
+            # Say why (unless it's our own teardown): a silently ended reader
+            # makes a truncated run indistinguishable from a clean one.
+            if p.alive:
+                print(f"     reader stopped: {exc}", flush=True)
             break
         if not data:
             break
-        buf.extend(data)
         # Cheap scan for `IAC DO COMPRESS2` (the MCCP attack waits on this).
         for i in range(len(data) - 2):
             if data[i] == IAC and data[i + 1] == DO and data[i + 2] == OPT_COMPRESS2:
@@ -343,9 +558,9 @@ def reader_thread(p: Peer) -> None:
     p.alive = False
 
 
-def handshake(p: Peer) -> None:
-    """A minimal, well-formed greeting so clients connect cleanly: offer GMCP
-    and EOR, print a banner. We don't require the client to answer."""
+def greet(p: Peer) -> None:
+    """A minimal, well-formed telnet-level greeting so clients connect cleanly:
+    offer GMCP and EOR, print a banner. We don't require the client to answer."""
     p.send(bytes([IAC, WILL, OPT_GMCP]))
     p.send(bytes([IAC, WILL, OPT_EOR]))
     e = ESC.decode()
@@ -387,29 +602,67 @@ def select_attacks(only: str | None, exclude: str | None) -> list[tuple[str, str
     return chosen
 
 
+def close_socket(sock: socket.socket) -> None:
+    """Best-effort shutdown + close, each step independently tolerated."""
+    for step in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
+        try:
+            step()
+        except OSError:
+            pass
+
+
+def build_transport(conn: socket.socket, args):
+    """Wrap the accepted socket in the transport for the chosen mode. Raises on
+    a failed TLS or WebSocket handshake, closing the socket first — for wss
+    that is the TLS-wrapped socket, which owns the fd (`wrap_socket` detaches
+    the accepted one, leaving it a husk a caller-side close cannot release)."""
+    if args.mode == "wss":
+        # The TLS handshake runs on the accept loop's only thread; a peer that
+        # connects and never sends a ClientHello (a port scanner, `nc`) must
+        # time out rather than park the whole server.
+        conn.settimeout(10.0)
+        try:
+            conn = args.ssl_context.wrap_socket(conn, server_side=True)
+        except socket.timeout as exc:
+            close_socket(conn)
+            raise ConnectionError("TLS handshake timed out") from exc
+        except Exception:
+            close_socket(conn)
+            raise
+        conn.settimeout(None)
+    if args.mode in ("ws", "wss"):
+        try:
+            return WsTransport(conn)
+        except Exception:
+            close_socket(conn)
+            raise
+    return RawTransport(conn)
+
+
 def serve_one(sock: socket.socket, args, selected) -> None:
     conn, addr = sock.accept()
     print(f"client connected from {addr[0]}:{addr[1]}", flush=True)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    p = Peer(conn, args.delay_ms, args.stress_bytes)
+    try:
+        transport = build_transport(conn, args)
+    except (OSError, ConnectionError, ssl.SSLError) as exc:
+        # build_transport closed the socket that owns the fd before raising.
+        print(f"     connection setup failed ({args.mode}): {exc}", flush=True)
+        return
+    if isinstance(transport, WsTransport):
+        print(f"     WebSocket handshake OK (path {transport.path})", flush=True)
+    p = Peer(transport, args.delay_ms, args.stress_bytes)
     t = threading.Thread(target=reader_thread, args=(p,), daemon=True)
     t.start()
     try:
-        handshake(p)
+        greet(p)
         p.sleep()
         run_attacks(p, selected)
         # Hold the connection briefly so trailing frames flush before we close.
         time.sleep(1.0)
     finally:
         p.alive = False
-        try:
-            conn.shutdown(socket.SHUT_RDWR)  # clean FIN, not a reset
-        except OSError:
-            pass
-        try:
-            conn.close()
-        except OSError:
-            pass
+        transport.close()
         print("client disconnected", flush=True)
 
 
@@ -425,6 +678,13 @@ def main() -> None:
     parser.add_argument("--only", help="comma-separated attack names to run (in catalog order)")
     parser.add_argument("--exclude", help="comma-separated attack names to skip")
     parser.add_argument("--list", action="store_true", help="print the attack catalog and exit")
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument("--ws", action="store_true",
+                           help="serve WebSocket (ws://) instead of raw TCP (for browser clients)")
+    transport.add_argument("--wss", action="store_true",
+                           help="serve secure WebSocket (wss://); requires --certfile and --keyfile")
+    parser.add_argument("--certfile", help="TLS certificate chain (PEM) for --wss")
+    parser.add_argument("--keyfile", help="TLS private key (PEM) for --wss")
     args = parser.parse_args()
 
     if args.list:
@@ -433,16 +693,29 @@ def main() -> None:
             print(f"{name.ljust(width)}  {desc}")
         return
 
+    args.mode = "wss" if args.wss else "ws" if args.ws else "raw"
+    if args.mode == "wss":
+        if not (args.certfile and args.keyfile):
+            sys.exit("--wss requires --certfile and --keyfile (see the README for a "
+                     "self-signed one-liner).")
+        args.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            args.ssl_context.load_cert_chain(args.certfile, args.keyfile)
+        except (OSError, ssl.SSLError) as exc:
+            sys.exit(f"could not load TLS cert/key: {exc}")
+
     selected = select_attacks(args.only, args.exclude)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((args.host, args.port))
     srv.listen(1)
-    print(f"smudgeon listening on {args.host}:{args.port} "
+    scheme = {"raw": "telnet://", "ws": "ws://", "wss": "wss://"}[args.mode]
+    print(f"smudgeon listening on {scheme}{args.host}:{args.port} "
           f"({len(selected)} attacks; {'looping' if args.loop else 'single connection'})",
           flush=True)
-    print("point a MUD client here and connect.", flush=True)
+    print(f"point a {'browser MUD client' if args.mode != 'raw' else 'MUD client'} "
+          f"here and connect.", flush=True)
 
     try:
         while True:
